@@ -21,14 +21,13 @@ setting reminders, searching the web). Only call a tool when the user's request 
 requires it. Be direct and concise. Never claim to have done something unless a tool result
 confirms it.`;
 
-// Convert our simple {role, text} history into Gemini's "contents" format.
 function toGeminiContents(history) {
   return history.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
     parts: m.functionResponse
       ? [{ functionResponse: m.functionResponse }]
       : m.functionCall
-      ? [{ functionCall: m.functionCall }]
+      ? [{ functionCall: m.functionCall, ...(m.thoughtSignature ? { thoughtSignature: m.thoughtSignature } : {}) }]
       : [{ text: m.text }],
   }));
 }
@@ -57,17 +56,20 @@ async function callGemini(history) {
 
   const functionCallPart = parts.find((p) => p.functionCall);
   if (functionCallPart) {
-    return { type: "tool_request", functionCall: functionCallPart.functionCall };
+    return {
+      type: "tool_request",
+      functionCall: functionCallPart.functionCall,
+      thoughtSignature: functionCallPart.thoughtSignature || null,
+    };
   }
 
   const textPart = parts.find((p) => p.text);
   return { type: "message", text: textPart?.text || "(no response)" };
 }
 
-// Main chat endpoint. Frontend sends the full running history each time.
 app.post("/chat", async (req, res) => {
   try {
-    const { history } = req.body; // [{role: 'user'|'assistant', text}]
+    const { history } = req.body;
     if (!GEMINI_API_KEY) {
       return res.status(500).json({ error: "Server is missing GEMINI_API_KEY. See backend/.env.example." });
     }
@@ -75,11 +77,11 @@ app.post("/chat", async (req, res) => {
     const result = await callGemini(history);
 
     if (result.type === "tool_request") {
-      // Do NOT execute yet. Ask the frontend to get user approval first.
       return res.json({
         type: "permission_request",
         tool: result.functionCall.name,
         args: result.functionCall.args,
+        thoughtSignature: result.thoughtSignature,
       });
     }
 
@@ -90,26 +92,21 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// Called after the user clicks Allow or Deny on a permission request.
 app.post("/confirm", async (req, res) => {
   try {
-    const { history, tool, args, approved } = req.body;
+    const { history, tool, args, approved, thoughtSignature } = req.body;
 
-    let toolResultText;
     let toolResultPayload;
 
     if (approved) {
       toolResultPayload = await executeTool(tool, args);
-      toolResultText = JSON.stringify(toolResultPayload);
     } else {
       toolResultPayload = { ok: false, error: "User denied permission for this action." };
-      toolResultText = JSON.stringify(toolResultPayload);
     }
 
-    // Feed the tool result back into the conversation so KORA can respond appropriately.
     const updatedHistory = [
       ...history,
-      { role: "assistant", functionCall: { name: tool, args } },
+      { role: "assistant", functionCall: { name: tool, args }, thoughtSignature },
       { role: "user", functionResponse: { name: tool, response: toolResultPayload } },
     ];
 
@@ -120,6 +117,7 @@ app.post("/confirm", async (req, res) => {
         type: "permission_request",
         tool: result.functionCall.name,
         args: result.functionCall.args,
+        thoughtSignature: result.thoughtSignature,
         historyForNext: updatedHistory,
       });
     }
