@@ -1,5 +1,5 @@
 // server.js
-// KORA's brain. Talks to Gemini, decides when a tool is needed,
+// KORA's brain. Talks to Groq (OpenAI-compatible), decides when a tool is needed,
 // and NEVER executes a tool without the frontend confirming the user approved it.
 
 import express from "express";
@@ -11,77 +11,96 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-flash";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const MODEL = "openai/gpt-oss-20b";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
-const SYSTEM_INSTRUCTION = `You are KORA, a fast, capable personal AI assistant.
+const SYSTEM_PROMPT = `You are KORA, a fast, capable personal AI assistant.
 You can chat normally, and you can also take real actions using tools (saving notes,
 setting reminders, searching the web). Only call a tool when the user's request actually
 requires it. Be direct and concise. Never claim to have done something unless a tool result
 confirms it.`;
 
-function toGeminiContents(history) {
-  return history.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: m.functionResponse
-      ? [{ functionResponse: m.functionResponse }]
-      : m.functionCall
-      ? [{ functionCall: m.functionCall, ...(m.thoughtSignature ? { thoughtSignature: m.thoughtSignature } : {}) }]
-      : [{ text: m.text }],
-  }));
+function toGroqMessages(history) {
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+  for (const m of history) {
+    if (m.toolCall) {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: m.toolCall.id,
+            type: "function",
+            function: { name: m.toolCall.name, arguments: JSON.stringify(m.toolCall.args) },
+          },
+        ],
+      });
+    } else if (m.toolResult) {
+      messages.push({
+        role: "tool",
+        tool_call_id: m.toolResult.toolCallId,
+        content: JSON.stringify(m.toolResult.response),
+      });
+    } else {
+      messages.push({ role: m.role, content: m.text });
+    }
+  }
+  return messages;
 }
 
-async function callGemini(history) {
+async function callGroq(history) {
   const body = {
-    system_instruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-    contents: toGeminiContents(history),
-    tools: [{ functionDeclarations: toolSchemas }],
+    model: MODEL,
+    messages: toGroqMessages(history),
+    tools: toolSchemas,
   };
 
-  const res = await fetch(GEMINI_URL, {
+  const res = await fetch(GROQ_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Gemini API error (${res.status}): ${errText}`);
+    throw new Error(`Groq API error (${res.status}): ${errText}`);
   }
 
   const data = await res.json();
-  const candidate = data.candidates?.[0];
-  const parts = candidate?.content?.parts || [];
+  const message = data.choices?.[0]?.message;
 
-  const functionCallPart = parts.find((p) => p.functionCall);
-  if (functionCallPart) {
+  const toolCall = message?.tool_calls?.[0];
+  if (toolCall) {
     return {
       type: "tool_request",
-      functionCall: functionCallPart.functionCall,
-      thoughtSignature: functionCallPart.thoughtSignature || null,
+      toolCallId: toolCall.id,
+      name: toolCall.function.name,
+      args: JSON.parse(toolCall.function.arguments || "{}"),
     };
   }
 
-  const textPart = parts.find((p) => p.text);
-  return { type: "message", text: textPart?.text || "(no response)" };
+  return { type: "message", text: message?.content || "(no response)" };
 }
 
 app.post("/chat", async (req, res) => {
   try {
     const { history } = req.body;
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({ error: "Server is missing GEMINI_API_KEY. See backend/.env.example." });
+    if (!GROQ_API_KEY) {
+      return res.status(500).json({ error: "Server is missing GROQ_API_KEY. See backend/.env.example." });
     }
 
-    const result = await callGemini(history);
+    const result = await callGroq(history);
 
     if (result.type === "tool_request") {
       return res.json({
         type: "permission_request",
-        tool: result.functionCall.name,
-        args: result.functionCall.args,
-        thoughtSignature: result.thoughtSignature,
+        tool: result.name,
+        args: result.args,
+        toolCallId: result.toolCallId,
       });
     }
 
@@ -94,10 +113,9 @@ app.post("/chat", async (req, res) => {
 
 app.post("/confirm", async (req, res) => {
   try {
-    const { history, tool, args, approved, thoughtSignature } = req.body;
+    const { history, tool, args, approved, toolCallId } = req.body;
 
     let toolResultPayload;
-
     if (approved) {
       toolResultPayload = await executeTool(tool, args);
     } else {
@@ -106,18 +124,18 @@ app.post("/confirm", async (req, res) => {
 
     const updatedHistory = [
       ...history,
-      { role: "assistant", functionCall: { name: tool, args }, thoughtSignature },
-      { role: "user", functionResponse: { name: tool, response: toolResultPayload } },
+      { role: "assistant", toolCall: { id: toolCallId, name: tool, args } },
+      { role: "tool", toolResult: { toolCallId, response: toolResultPayload } },
     ];
 
-    const result = await callGemini(updatedHistory);
+    const result = await callGroq(updatedHistory);
 
     if (result.type === "tool_request") {
       return res.json({
         type: "permission_request",
-        tool: result.functionCall.name,
-        args: result.functionCall.args,
-        thoughtSignature: result.thoughtSignature,
+        tool: result.name,
+        args: result.args,
+        toolCallId: result.toolCallId,
         historyForNext: updatedHistory,
       });
     }
